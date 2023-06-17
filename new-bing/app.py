@@ -129,10 +129,11 @@ async def reset_conversation(sid, reset=False):
 
 
 def show_chatgpt(sid):
+    # 1 chatgpt 2 bard
     for openid in conversation_ctr.get_openai_whitelist():
         if openid.decode() in sid:
             return 3
-    return 0
+    return 2
 
 
 def check_blocked(sid):
@@ -659,7 +660,7 @@ async def ws_bard(_, ws):
             bot = await get_bard_bot(sid)
             resp = await bot.ask(q)
             text = resp['content'].replace('\r\n', '\n')
-            if resp['images']:
+            if resp.get('images'):
                 text += '\n'
                 for x in resp['images']:
                     if x.startswith('http'):
