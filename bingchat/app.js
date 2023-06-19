@@ -10,10 +10,6 @@ App({
         that.globalData.chatType = res.data;
       },
     });
-    // this.getSid((sid) => {
-    //   console.log(sid);
-    // });
-    // this.upload_conversation();
     if (that.globalData.sid) {
       that.upload_cache_conversation(that.globalData.sid);
     } else {
@@ -30,6 +26,7 @@ App({
   },
   globalData: {
     chatType: "bing",
+    channel: [{ name: "New Bing", value: "bing" }],
   },
   upload_cache_conversation: function (sid) {
     var that = this;
@@ -42,7 +39,7 @@ App({
           sid: sidPrefix + sid,
           conversations: data,
         }).then((res) => {
-          that.globalData["saved"] = res.data["saved"];
+          that.globalData["channel"] = res.data["channel"];
           console.log("upload " + data.length + " conversations success!");
         });
       },
@@ -60,6 +57,7 @@ App({
           sid: sidPrefix + sid,
           conversations: conversations,
         }).then((res) => {
+          that.globalData["channel"] = res.data["channel"];
           console.log(
             "upload " + conversations.length + " conversations success!"
           );
@@ -79,10 +77,11 @@ App({
             })
               .then((data) => {
                 if (data.statusCode != 200) {
-                  callback("");
+                  callback("anonymous");
                   return;
                 }
                 that.globalData.sid = data.data.data.openid;
+                that.globalData.channel = data.data.data.channel;
                 wx.setStorageSync("sid1", that.globalData.sid);
                 callback(data.data.data.openid);
               })
