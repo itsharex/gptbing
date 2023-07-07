@@ -17,6 +17,7 @@ import requests
 import tiktoken
 from easy_ernie import FastErnie
 from sanic import Sanic
+from sanic.exceptions import SanicException
 from sanic.response import json
 
 from Bard import Chatbot as BardBot
@@ -97,14 +98,14 @@ def check_hidden(text):
 
 def get_cookie_file(sid, cookie_files, reset=False):
     # 优先获取最后一个
-    if not reset and show_chatgpt(sid) & 1:
+    if not reset and get_authority(sid) & 1:
         return cookie_files[-1]
     # 根据sid相加取余算出一个数
     total_cookie_num = len(cookie_files) - 1
     return cookie_files[(
         sum([ord(x)
              for x in sid.replace('_', '').replace('-', '')[10:]]) + conversation_ctr.get_switch_cookie_step(sid)
-    ) % total_cookie_num]
+    ) % (total_cookie_num if total_cookie_num else 1)]
 
 
 def get_bot(sid, cookie_path=None):
@@ -126,6 +127,7 @@ def get_bot(sid, cookie_path=None):
         logger.info('Reload %s session success.', sid)
     except Exception:
         bot = Chatbot(cookie_path=cookie_path)
+    Cha
     bots[sid] = {
         'bot': bot,
         'expired': datetime.now() + timedelta(days=89, hours=23, minutes=55),  # 会话有效期为90天
@@ -134,16 +136,15 @@ def get_bot(sid, cookie_path=None):
 
 
 async def reset_conversation(sid, reset=False):
-    await get_bot(sid, cookie_path=get_cookie_file(sid, COOKIE_FILES, reset=reset)).reset()
+    cookie_path = get_cookie_file(sid, COOKIE_FILES, reset=reset)
+    await get_bot(sid, cookie_path=cookie_path).reset()
     bots[sid]['expired'] = datetime.now() + timedelta(days=89, hours=23, minutes=55)  # 会话有效期为90天
+    logger.info('[BotCookie] %s reset conversation with cookie: %s', sid, cookie_path)
 
 
-def show_chatgpt(sid):
-    # 1 chatgpt 2 bard 4 baidu
-    for openid in conversation_ctr.get_openai_whitelist():
-        if openid.decode() in sid:
-            return 7
-    return 6
+def get_authority(sid):
+    # 0 bing 1 chatgpt 2 bard 4 baidu
+    return conversation_ctr.get_authority(sid[-28:])
 
 
 def get_show_channel(sid, authority=0):
@@ -152,7 +153,7 @@ def get_show_channel(sid, authority=0):
         'value': 'bing'
     }]
     if not authority:
-        authority = show_chatgpt(sid)
+        authority = get_authority(sid)
     if authority & 1:
         res.append({
             'name': 'ChatGPT',
@@ -177,9 +178,20 @@ def check_blocked(sid):
             return True
 
 
+def remove_redudant_url(s):
+    for x in re.findall(r'\[\d+\]:\s.*', s):
+        if '"' not in x:
+            s = s.replace(x + '\n', '')
+    for x in re.findall(r'.*:\s\[.*\].*', s):
+        if x.startswith(':'):
+            s = s.replace(x, '')
+    return s.strip()
+
+
 def make_response_data(status, text, suggests, message, num_in_conversation=-1, final=True):
     if not text.strip():
         text = '实在抱歉，我现在无法回答这个问题。 我还能为您提供哪些帮助？'
+    text = remove_redudant_url(text)
     data = {
         'data': {
             'status': status,
@@ -220,7 +232,8 @@ async def ask_bing(ws, sid, q, style, another_try=False):
             'data': make_response_data('Success', resp, [], '')
         }))
         return
-    async for response in get_bot(sid).ask_stream(
+    bot = get_bot(sid)
+    async for response in bot.ask_stream(
             q,
             conversation_style=ConversationStyle[style],
             another_try=another_try,
@@ -236,6 +249,10 @@ async def ask_bing(ws, sid, q, style, another_try=False):
                 raise Exception(
                     'The last message is being processed. Please wait for a while before submitting further messages.'
                 )
+            if processed_data['data']['status'] == 'CaptchaChallenge':
+                conversation_ctr.publish_captcha(bot.cookie_path)
+                await reset_conversation(sid, reset=True)
+                raise Exception('User needs to solve CAPTCHA to continue.')
             if processed_data['data']['status'] == 'InternalError':
                 if last_not_final_text and not last_not_final_text.startswith('正在搜索'):
                     processed_data = make_response_data(
@@ -258,7 +275,7 @@ async def ask_bing(ws, sid, q, style, another_try=False):
                 last_not_final_text = res
                 await ws.send(raw_json.dumps({
                     'final': final,
-                    'data': res,
+                    'data': remove_redudant_url(res),
                 }))
 
 
@@ -278,7 +295,7 @@ def check_forbidden_words(sid, q):
 
 def check_limit(sid):
     incr = conversation_ctr.get_day_limit(sid)
-    if show_chatgpt(sid) & 1:
+    if get_authority(sid) & 1:
         return False
     return True if incr > DAY_LIMIT else False
 
@@ -300,17 +317,20 @@ async def ws_chat(_, ws):
                 raise Exception(NO_ACCESS)
             if check_limit(sid[-28:]):
                 raise Exception(OVER_DAY_LIMIT)
-            # 发生错误，重试10次
-            try_times = 10
+            # 发生错误，重试5次
+            try_times = 5
             await ask_bing(ws, sid, q, style)
             msg = ''
+        except SanicException as e:
+            msg = str(e) or SERVICE_NOT_AVALIABLE
+            try_times = 0
         except KeyError:
             msg = SERVICE_NOT_AVALIABLE
         except Exception as e:
             logger.error('%s', traceback.format_exc())
             msg = str(e) or SERVICE_NOT_AVALIABLE
         if msg:
-            while try_times and msg and 'sanic.exceptions' not in msg:
+            while try_times and msg:
                 try:
                     try_times -= 1
                     if OVER_DAY_LIMIT in msg or NO_ACCESS in msg or 'Your prompt has been blocked by Bing' in msg:
@@ -330,6 +350,9 @@ async def ws_chat(_, ws):
                         another_try=another_try,
                     )
                     msg = ''
+                except SanicException as e:
+                    msg = str(e) or SERVICE_NOT_AVALIABLE
+                    try_times = 0
                 except KeyError:
                     msg = SERVICE_NOT_AVALIABLE
                 except Exception as e:
@@ -452,7 +475,7 @@ async def openid(request):
     code = request.args.get('code')
     url = WX_URL % (APPID, APPSECRET, code)
     data = requests.get(url).json()
-    authority = show_chatgpt(data['openid'])
+    authority = get_authority(data['openid'])
     data['saved'] = authority
     data['channel'] = get_show_channel(data['openid'], authority=authority)
     return json({'data': data})
@@ -523,7 +546,7 @@ async def ws_openai_chat(_, ws):
             data = raw_json.loads(data)
             logger.info('[openai] Websocket receive data: %s', data)
             sid = data['sid']
-            if not (show_chatgpt(sid) & 1):
+            if not (get_authority(sid) & 1):
                 raise Exception(NO_ACCESS)
             q = data['q']
             forbid_data = check_forbidden_words(sid, q)
@@ -597,7 +620,7 @@ async def openai_chat(request):
     try:
         logger.info('[openai] Http request payload: %s', request.json)
         sid = request.json.get('sid')
-        if not (show_chatgpt(sid) & 1):
+        if not (get_authority(sid) & 1):
             raise Exception(NO_ACCESS)
         q = request.json.get('q')
         resp = await generate_image(q, sid)
@@ -650,7 +673,7 @@ async def save(request):
     if check_blocked(sid) or 'servicewechat.com/wxee7496be5b68b740' not in request.headers.get('referer', ''):
         raise Exception(NO_ACCESS)
     conversation_ctr.save(sid, request.json.get('conversations'))
-    authority = show_chatgpt(sid)
+    authority = get_authority(sid)
     return json({
         'saved': authority,
         'channel': get_show_channel(sid, authority=authority),
@@ -715,7 +738,7 @@ async def ws_bard(_, ws):
             data = raw_json.loads(data)
             logger.info('[bard] Websocket receive data: %s', data)
             sid = data['sid']
-            if not (show_chatgpt(sid) & 2):
+            if not (get_authority(sid) & 2):
                 raise Exception(NO_ACCESS)
             if check_blocked(sid):
                 raise Exception(NO_ACCESS)
@@ -796,7 +819,7 @@ async def ws_common(_, ws):
                 break
             bot = get_channel_bot(sid, channel)
             if channel == 'baidu':
-                if not (show_chatgpt(sid) & 4):
+                if not (get_authority(sid) & 4):
                     raise Exception(NO_ACCESS)
                 for message in bot.askStream(q):
                     if not message:
